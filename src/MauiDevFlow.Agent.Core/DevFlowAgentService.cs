@@ -42,6 +42,14 @@ public class DevFlowAgentService : IDisposable, IMarkerPublisher
     /// </summary>
     public SensorManager Sensors { get; }
 
+    /// <summary>
+    /// Registry of named in-app handlers that can be invoked remotely by test runners
+    /// via <c>POST /api/backdoor/{name}</c>.  Register handlers here during app startup
+    /// to expose test-only actions (seed data, configure state, trigger navigation, etc.)
+    /// without having to exercise the UI.
+    /// </summary>
+    public TestBackdoorRegistry Backdoor { get; } = new();
+
     private readonly IProfilerCollector _profilerCollector;
     private readonly ProfilerSessionStore _profilerSessions;
     private readonly SemaphoreSlim _profilerStateGate = new(1, 1);
@@ -408,6 +416,10 @@ public class DevFlowAgentService : IDisposable, IMarkerPublisher
         _server.MapPost("/api/sensors/{sensor}/start", HandleSensorStart);
         _server.MapPost("/api/sensors/{sensor}/stop", HandleSensorStop);
         _server.MapWebSocket("/ws/sensors", HandleSensorWebSocket);
+
+        // Test backdoor (UI testing support)
+        _server.MapGet("/api/backdoor", HandleBackdoorList);
+        _server.MapPost("/api/backdoor/{name}", HandleBackdoorInvoke);
     }
 
     private async Task<HttpResponse> HandleStatus(HttpRequest request)
@@ -4396,6 +4408,43 @@ public class DevFlowAgentService : IDisposable, IMarkerPublisher
             Sensors.Unsubscribe(sensorName, queue);
         }
     }
+
+    // ── Test backdoor ────────────────────────────────────────────────────────
+
+    private Task<HttpResponse> HandleBackdoorList(HttpRequest request)
+    {
+        var names = Backdoor.GetNames();
+        var result = new BackdoorListResponse { Handlers = names };
+        return Task.FromResult(HttpResponse.Json(result));
+    }
+
+    private async Task<HttpResponse> HandleBackdoorInvoke(HttpRequest request)
+    {
+        if (!request.RouteParams.TryGetValue("name", out var name) || string.IsNullOrWhiteSpace(name))
+            return HttpResponse.Error("handler name is required");
+
+        try
+        {
+            var resultJson = await Backdoor.InvokeAsync(name, request.Body).ConfigureAwait(false);
+            if (resultJson == null)
+                return HttpResponse.Ok(null);
+            return new HttpResponse
+            {
+                StatusCode = 200,
+                StatusText = "OK",
+                ContentType = "application/json",
+                Body = resultJson
+            };
+        }
+        catch (KeyNotFoundException)
+        {
+            return HttpResponse.NotFound($"No backdoor handler registered for '{name}'.");
+        }
+        catch (Exception ex)
+        {
+            return HttpResponse.Error($"Backdoor handler '{name}' threw: {ex.Message}", 500);
+        }
+    }
 }
 
 // Request DTOs
@@ -4441,4 +4490,9 @@ public class PreferenceSetRequest
 public class SecureStorageSetRequest
 {
     public string? Value { get; set; }
+}
+
+public class BackdoorListResponse
+{
+    public IReadOnlyList<string> Handlers { get; set; } = [];
 }
