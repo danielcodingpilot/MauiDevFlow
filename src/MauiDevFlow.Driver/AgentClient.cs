@@ -481,6 +481,43 @@ public class AgentClient : IDisposable
         _http.Dispose();
     }
 
+    // ── Test backdoor ──
+
+    /// <summary>
+    /// Returns the names of all backdoor handlers currently registered in the app.
+    /// </summary>
+    public async Task<List<string>> ListBackdoorHandlersAsync()
+    {
+        try
+        {
+            var result = await GetAsync<BackdoorListResponse>("/api/backdoor");
+            return result?.Handlers?.ToList() ?? new();
+        }
+        catch { return new(); }
+    }
+
+    /// <summary>
+    /// Invokes a named backdoor handler registered in the app and returns the raw JSON result.
+    /// </summary>
+    /// <param name="name">Handler name (case-insensitive).</param>
+    /// <param name="args">Optional arguments to serialize as the JSON request body.</param>
+    /// <returns>Parsed JSON response body, or <c>null</c> on failure.</returns>
+    public async Task<JsonElement?> InvokeBackdoorAsync(string name, object? args = null)
+    {
+        try
+        {
+            var json = args != null ? JsonSerializer.Serialize(args) : "{}";
+            using var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _http.PostAsync(
+                $"{_baseUrl}/api/backdoor/{Uri.EscapeDataString(name)}", content);
+            var body = await response.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(body))
+                return null;
+            return JsonSerializer.Deserialize<JsonElement>(body);
+        }
+        catch { return null; }
+    }
+
     // ── Network monitoring ──
 
     public async Task<List<NetworkRequest>> GetNetworkRequestsAsync(
@@ -759,4 +796,10 @@ public class ProfilerCapabilities
     public bool UiThreadStallSupported { get; set; }
     [System.Text.Json.Serialization.JsonPropertyName("threadCountSupported")]
     public bool ThreadCountSupported { get; set; }
+}
+
+public class BackdoorListResponse
+{
+    [System.Text.Json.Serialization.JsonPropertyName("handlers")]
+    public List<string> Handlers { get; set; } = new();
 }

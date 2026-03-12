@@ -772,6 +772,30 @@ class Program
 
         mauiCommand.Add(sensorsCommand);
 
+        // ===== MAUI backdoor subcommands (UI testing) =====
+        var backdoorCommand = new Command("backdoor", "Invoke in-app test backdoor handlers");
+
+        var backdoorListCmd = new Command("list", "List all registered backdoor handler names");
+        backdoorListCmd.SetHandler(async (host, port, json, noJson) =>
+            await SimpleGetAsync(host, port, "/api/backdoor", OutputWriter.ResolveJsonMode(json, noJson)),
+            agentHostOption, agentPortOption, jsonOption, noJsonOption);
+        backdoorCommand.Add(backdoorListCmd);
+
+        var backdoorNameArg = new Argument<string>("name", "Handler name to invoke");
+        var backdoorArgsOption = new Option<string?>("--args", "JSON body to pass to the handler");
+        var backdoorInvokeCmd = new Command("invoke", "Invoke a backdoor handler by name") { backdoorNameArg, backdoorArgsOption };
+        backdoorInvokeCmd.SetHandler(async (host, port, json, noJson, name, args) =>
+        {
+            var isJson = OutputWriter.ResolveJsonMode(json, noJson);
+            object? body = args != null
+                ? System.Text.Json.JsonSerializer.Deserialize<object>(args)
+                : null;
+            await SimplePostAsync(host, port, $"/api/backdoor/{Uri.EscapeDataString(name)}", body, isJson);
+        }, agentHostOption, agentPortOption, jsonOption, noJsonOption, backdoorNameArg, backdoorArgsOption);
+        backdoorCommand.Add(backdoorInvokeCmd);
+
+        mauiCommand.Add(backdoorCommand);
+
         rootCommand.Add(mauiCommand);
 
         // ===== update-skill command =====

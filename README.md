@@ -24,6 +24,7 @@ manually check the simulator.
 - **App Storage Management** — Read, write, and delete Preferences (typed key-value) and SecureStorage entries remotely
 - **Platform Features** — Query device info, battery, connectivity, display, permissions, version tracking, geolocation, and app info
 - **Sensor Streaming** — Start/stop device sensors (accelerometer, gyroscope, compass, barometer, magnetometer, orientation) with real-time WebSocket streaming
+- **Test Backdoor** — Register named in-app handlers (seed data, configure state, trigger auth) invokable remotely by test runners via `POST /api/backdoor/{name}` — no UI required
 - **Broker Daemon** — Automatic port assignment and agent discovery for simultaneous multi-app debugging
 - **CLI Tool** (`maui-devflow`) — Scriptable commands for both native and Blazor automation
 - **Driver Library** — Platform-aware (Mac Catalyst, Android, iOS Simulator, Linux/GTK) orchestration
@@ -191,6 +192,11 @@ maui-devflow MAUI platform geolocation            # GPS coordinates
 maui-devflow MAUI sensors list                    # list sensors + status
 maui-devflow MAUI sensors stream accelerometer    # live WebSocket stream
 
+# Test backdoor (drive app-side state from test runners)
+maui-devflow MAUI backdoor list                   # list registered handler names
+maui-devflow MAUI backdoor invoke seed-db         # call a handler (no args)
+maui-devflow MAUI backdoor invoke login --args '{"username":"test@example.com","password":"pass"}'
+
 # Live edit native properties (no rebuild)
 maui-devflow MAUI set-property HeaderLabel TextColor "Tomato"
 maui-devflow MAUI set-property HeaderLabel FontSize "32"
@@ -273,6 +279,106 @@ The `--webview` (`-w`) option is available on every `cdp` subcommand.
 > destroy/recreate the JavaScript context — the Chobitsu debug bridge is automatically
 > re-injected after reload/navigation completes.
 
+## Test Backdoor
+
+The test backdoor lets you drive **app-side state from external test runners** (xUnit, NUnit, UITest, custom scripts) without interacting through the UI. Register named handlers in `MauiProgram.cs` and invoke them remotely via the agent.
+
+### Registering Handlers
+
+```csharp
+// MauiProgram.cs
+#if DEBUG
+builder.AddMauiDevFlowAgent(options => { options.Port = 9223; });
+#endif
+
+var app = builder.Build();
+
+#if DEBUG
+// Get the agent after Build() so you can also resolve other services
+var agent = app.Services.GetRequiredService<DevFlowAgentService>();
+var todos  = app.Services.GetRequiredService<TodoService>();
+
+// Async handler — await any async work before returning the JSON result
+agent.Backdoor.Register("seed-db", async _ =>
+{
+    await SeedDatabaseAsync();
+    return """{"status":"seeded"}""";
+});
+
+// Sync handler — both sync and async overloads are supported
+agent.Backdoor.Register("reset", _ =>
+{
+    todos.Items.Clear();
+    return """{"status":"reset"}""";
+});
+
+// Handler with JSON args — always validate args before deserializing
+agent.Backdoor.Register("login", async args =>
+{
+    if (string.IsNullOrWhiteSpace(args))
+        return """{"success":false,"error":"args required"}""";
+    var req = JsonSerializer.Deserialize<LoginRequest>(args);
+    if (req == null) return """{"success":false,"error":"invalid args"}""";
+    await LoginAsync(req.Username, req.Password);
+    return """{"success":true}""";
+});
+#endif
+
+return app;
+```
+
+> Handlers are `#if DEBUG` only — they are never compiled or reachable in release builds.
+> Both synchronous (`Func<string?, string?>`) and asynchronous (`Func<string?, Task<string?>>`) handler overloads are supported.
+
+### Invoking via CLI
+
+```bash
+# List registered handler names
+maui-devflow MAUI backdoor list
+
+# Invoke a handler with no arguments
+maui-devflow MAUI backdoor invoke seed-db
+
+# Invoke with JSON arguments
+maui-devflow MAUI backdoor invoke login --args '{"username":"test@example.com","password":"pass"}'
+```
+
+### Invoking via Driver (xUnit / NUnit)
+
+```csharp
+using MauiDevFlow.Driver;
+
+// In your test setup / [SetUp] method
+using var client = new AgentClient("localhost", 9223);
+
+// List available handlers
+var names = await client.ListBackdoorHandlersAsync();
+
+// Invoke a handler with no args
+await client.InvokeBackdoorAsync("seed-db");
+
+// Invoke with structured args (serialized to JSON automatically)
+var result = await client.InvokeBackdoorAsync("login",
+    new { Username = "test@example.com", Password = "pass" });
+```
+
+### Invoking via HTTP
+
+```http
+GET  /api/backdoor
+     → {"handlers":["seed-db","login","reset"]}
+
+POST /api/backdoor/seed-db
+     → {"status":"seeded"}
+
+POST /api/backdoor/login
+     Content-Type: application/json
+     {"username":"test@example.com","password":"pass"}
+     → {"success":true}
+```
+
+Errors: `404 Not Found` if no handler is registered with that name; `500 Internal Server Error` (with the exception message) if the handler throws.
+
 ## Agent API
 
 The Agent runs inside the MAUI app and exposes an HTTP/JSON REST API. The port is
@@ -324,6 +430,8 @@ Platform endpoints return structured JSON errors on failure. In addition to `suc
 | `/api/sensors/{sensor}/start` | POST | Start sensor. `?speed=UI\|Game\|Fastest\|Default` |
 | `/api/sensors/{sensor}/stop` | POST | Stop sensor |
 | `/ws/sensors` | WS | Stream sensor readings. `?sensor=accelerometer` `?speed=UI` |
+| `/api/backdoor` | GET | List names of all registered test backdoor handlers |
+| `/api/backdoor/{name}` | POST | Invoke a named handler. Body: optional JSON args. Returns handler's JSON result. `404` if not registered, `500` if handler throws |
 | `/api/cdp` | POST | Forward CDP command to Blazor WebView. Use `?webview=<id>` to target a specific WebView |
 | `/api/cdp/webviews` | GET | List registered CDP WebViews (index, AutomationId, elementId, ready status) |
 | `/api/cdp/source` | GET | Get page HTML source. Use `?webview=<id>` to target a specific WebView |
@@ -370,6 +478,7 @@ Hybrid page, connected via Shell navigation (`//native` and `//blazor` routes). 
 - **Dark mode support** — both native (AppThemeBinding) and Blazor (`@media prefers-color-scheme`) adapt to system theme
 - **Description field** — todo items support title + optional description on both pages
 - **Multi-WebView** — the `//multiblazor` route shows two side-by-side BlazorWebViews (`BlazorLeft` and `BlazorRight`) for testing multi-WebView CDP targeting
+- **Test backdoor handlers** — `seed-todos` (add test items), `clear-todos` (reset list), and `todo-summary` (return counts) are registered at startup to demonstrate the backdoor from test runners
 
 ## Platform Support
 
